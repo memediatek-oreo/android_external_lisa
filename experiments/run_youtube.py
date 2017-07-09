@@ -1,8 +1,4 @@
 #!/usr/bin/env python
-# This experiment enables CGroup tracing for UiBench workloads
-# The main difference between the run_uibench.py experiment is:
-# - post_collect_start hook used to dump fake cgroup events
-# - extra event: 'cgroup_attach_task' passed to systrace_start
 
 import logging
 
@@ -19,19 +15,14 @@ import pandas as pd
 import sqlite3
 import argparse
 import shutil
-import time
 
-parser = argparse.ArgumentParser(description='UiBench tests')
+parser = argparse.ArgumentParser(description='YouTube tests')
 
 parser.add_argument('--out_prefix', dest='out_prefix', action='store', default='default',
                     help='prefix for out directory')
 
 parser.add_argument('--collect', dest='collect', action='store', default='systrace',
                     help='what to collect (default systrace)')
-
-parser.add_argument('--test', dest='test_name', action='store',
-                    default='UiBenchJankTests#testGLTextureView',
-                    help='which test to run')
 
 parser.add_argument('--duration', dest='duration_s', action='store',
                     default=30, type=int,
@@ -42,34 +33,9 @@ parser.add_argument('--serial', dest='serial', action='store',
 
 args = parser.parse_args()
 
-def trace_cgroup(controller, cgroup):
-    cgroup = te.target.cgroups.controllers[controller].cgroup('/' + cgroup)
-    cgroup.trace_cgroup_tasks()
-
-def post_collect_start():
-    # Since systrace starts asynchronously, wait for trace to start
-    while True:
-        if te.target.execute('cat /d/tracing/tracing_on')[0] == "0":
-            time.sleep(0.1)
-            continue
-        break
-
-    trace_cgroup('schedtune', '')           # root
-    trace_cgroup('schedtune', 'top-app')
-    trace_cgroup('schedtune', 'foreground')
-    trace_cgroup('schedtune', 'background')
-    trace_cgroup('schedtune', 'rt')
-
-    trace_cgroup('cpuset', '')              # root
-    trace_cgroup('cpuset', 'top-app')
-    trace_cgroup('cpuset', 'foreground')
-    trace_cgroup('cpuset', 'background')
-    trace_cgroup('cpuset', 'system-background')
-
-
 def experiment():
     # Get workload
-    wload = Workload.getInstance(te, 'UiBench')
+    wload = Workload.getInstance(te, 'YouTube')
 
     outdir=te.res_dir + '_' + args.out_prefix
     try:
@@ -79,10 +45,7 @@ def experiment():
         pass
     os.makedirs(outdir)
 
-    wload.add_hook('post_collect_start', post_collect_start)
-
-    # Run UiBench
-    wload.run(outdir, test_name=args.test_name, duration_s=args.duration_s, collect=args.collect)
+    wload.run(outdir, video_url='https://www.youtube.com/watch?v=NLZRYQMLDW4', video_duration_s=args.duration_s, collect=args.collect)
 
     # Dump platform descriptor
     te.platform_dump(te.res_dir)
@@ -106,22 +69,18 @@ my_conf = {
     # "device"       : "HT6880200489",
 
     # Folder where all the results will be collected
-    "results_dir" : "UiBench",
+    "results_dir" : "YouTube",
 
     # Define devlib modules to load
     "modules"     : [
         'cpufreq',      # enable CPUFreq support
         'cpuidle',      # enable cpuidle support
-        'cgroups'       # Enable for cgroup support
+        # 'cgroups'     # Enable for cgroup support
     ],
 
     "emeter" : {
         'instrument': 'monsoon',
         'conf': { }
-    },
-
-    "systrace": {
-        'extra_events': ['cgroup_attach_task']
     },
 
     # Tools required by the experiments
