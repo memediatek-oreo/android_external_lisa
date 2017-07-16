@@ -324,6 +324,7 @@ class Trace(object):
                 tasks = df[name_key].unique()
             self.getTasks(df, tasks, name_key=name_key, pid_key=pid_key)
             self._scanTasks(df, name_key=name_key, pid_key=pid_key)
+            self._scanTgids(df)
 
         if 'sched_switch' in self.available_events:
             load(tasks, 'sched_switch', 'next_comm', 'next_pid')
@@ -373,6 +374,15 @@ class Trace(object):
             self._log.debug('Overutilized time: %.6f [s] (%.3f%% of trace time)',
                            self.overutilized_time, self.overutilized_prc)
 
+    def _scanTgids(self, df):
+        if not '__tgid' in df.columns:
+            return
+        df = df[['__pid', '__tgid']]
+        df = df.drop_duplicates(keep='first').set_index('__pid')
+        df.rename(columns = { '__pid': 'pid', '__tgid': 'tgid' },
+                              inplace=True)
+        self._pid_tgid = df
+
     def _scanTasks(self, df, name_key='comm', pid_key='pid'):
         """
         Extract tasks names and PIDs from the input data frame. The data frame
@@ -389,7 +399,7 @@ class Trace(object):
         :param pid_key: The name of the dataframe columns containing task PIDs
         :type pid_key: str
         """
-        df = df[[name_key, pid_key]]
+        df = df[[name_key, pid_key]].drop_duplicates()
         self._tasks_by_name = df.set_index(name_key)
         self._tasks_by_pid = df.set_index(pid_key)
 
@@ -420,6 +430,9 @@ class Trace(object):
             return list({task[0] for task in
                          self._tasks_by_pid.ix[pid].values})
         return [self._tasks_by_pid.ix[pid].values[0]]
+
+    def getTgidFromPid(self, pid):
+        return _pid_tgid.ix[pid].values[0]
 
     def getTasks(self, dataframe=None,
                  task_names=None, name_key='comm', pid_key='pid'):
@@ -537,6 +550,10 @@ class Trace(object):
         cgroup_events = ['cgroup_attach_task', 'cgroup_attach_task_devlib']
         df = None
 
+        if set(cgroup_events).isdisjoint(set(self.available_events)):
+            self._log.error('atleast one of {} is needed for cgroup_attach_task event generation'.format(cgroup_events))
+            return None
+
         for cev in cgroup_events:
             if not cev in self.available_events:
                 continue
@@ -551,6 +568,7 @@ class Trace(object):
         df.dropna(inplace=True, how='any')
         return df
 
+    @memoized
     def _dfg_cgroup_attach_task(self, controllers = ['schedtune', 'cpuset']):
         # Since fork doesn't result in attach events, generate fake attach events
         # The below mechanism doesn't work to propogate nested fork levels:
@@ -563,6 +581,9 @@ class Trace(object):
             ret_df = trappy.utils.merge_dfs(fdf, cdf, pivot='pid')
             return ret_df
 
+        if not 'sched_process_fork' in self.available_events:
+            self._log.error('sched_process_fork is mandatory to get proper cgroup_attach events')
+            return None
         fdf = self._dfg_trace_event('sched_process_fork')
 
         forks_len = len(fdf)
@@ -571,7 +592,7 @@ class Trace(object):
         for idx, c in enumerate(controllers):
             fdf = fork_add_cgroup(fdf, cdf, c)
             if (idx != (len(controllers) - 1)):
-                fdf = pd.concat([fdf, forkdf]).sort(columns='__line')
+                fdf = pd.concat([fdf, forkdf]).sort_values(by='__line')
 
         fdf = fdf[['__line', 'child_pid', 'controller', 'cgroup']]
         fdf.rename(columns = { 'child_pid': 'pid' }, inplace=True)
@@ -581,13 +602,14 @@ class Trace(object):
 
         new_forks_len = len(fdf) / len(controllers)
 
-        fdf = pd.concat([fdf, cdf]).sort(columns='__line')
+        fdf = pd.concat([fdf, cdf]).sort_values(by='__line')
 
         if new_forks_len < forks_len:
             dropped = forks_len - new_forks_len
             self._log.info("Couldn't attach all forks cgroup with-attach events ({} dropped)".format(dropped))
         return fdf
 
+    @memoized
     def _dfg_sched_switch_cgroup(self, controllers = ['schedtune', 'cpuset']):
         def sched_switch_add_cgroup(sdf, cdf, controller, direction):
             cdf = cdf[cdf['controller'] == controller]
@@ -600,6 +622,9 @@ class Trace(object):
             ret_df.rename(columns = { 'cgroup': direction + '_' + controller }, inplace=True)
             return ret_df
 
+        if not 'sched_switch' in self.available_events:
+            self._log.error('sched_switch is mandatory to generate sched_switch_cgroup event')
+            return None
         sdf = self._dfg_trace_event('sched_switch')
         cdf = self._dfg_cgroup_attach_task()
 
@@ -607,6 +632,13 @@ class Trace(object):
             sdf = sched_switch_add_cgroup(sdf, cdf, c, 'next')
             sdf = sched_switch_add_cgroup(sdf, cdf, c, 'prev')
 
+        # Augment with TGID information
+        sdf = sdf.join(self._pid_tgid, on='next_pid').rename(columns = {'tgid': 'next_tgid'})
+        sdf = sdf.join(self._pid_tgid, on='prev_pid').rename(columns = {'tgid': 'prev_tgid'})
+
+        df = self._tasks_by_pid.rename(columns = { 'next_comm': 'comm' })
+        sdf = sdf.join(df, on='next_tgid').rename(columns = {'comm': 'next_tgid_comm'})
+        sdf = sdf.join(df, on='prev_tgid').rename(columns = {'comm': 'prev_tgid_comm'})
         return sdf
 
 ###############################################################################
@@ -760,6 +792,9 @@ class Trace(object):
 
     # Sanitize cgroup information helper
     def _helper_sanitize_CgroupAttachTask(self, df, allowed_cgroups, controller_id_name):
+        # Drop rows that aren't in the root-id -> name map
+        df = df[df['dst_root'].isin(controller_id_name.keys())]
+
         def get_cgroup_name(path, valid_names):
             name = os.path.basename(path)
             name = 'root' if not name in valid_names else name

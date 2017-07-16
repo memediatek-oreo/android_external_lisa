@@ -19,6 +19,7 @@
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as fm
 import pandas as pd
 import pylab as pl
 import operator
@@ -27,7 +28,6 @@ from devlib.utils.misc import memoized
 import numpy as np
 import logging
 import trappy
-
 from analysis_module import AnalysisModule
 from trace import ResidencyTime, ResidencyData
 from bart.common.Utils import area_under_curve
@@ -114,7 +114,7 @@ class ResidencyAnalysis(AnalysisModule):
         # Each element of the array represents a single entity (core) to calculate on
         # Each array entry is a hashtable, for ex: residency['pid'][0][123]
         # is the residency of PID 123 on core 0
-        self.residency = { 'pid': [], 'tgid': [], 'schedtune': [], 'cpuset': [] }
+        self.residency = { }
         super(ResidencyAnalysis, self).__init__(trace)
 
     def generate_residency_data(self, pivot_type, pivot_ids):
@@ -135,16 +135,17 @@ class ResidencyAnalysis(AnalysisModule):
             dict_ret['total'] = total
             yield dict_ret
 
+    @memoized
     def _dfg_cpu_residencies(self, pivot, event_name='sched_switch'):
        # Build a list of pids
         df = self._dfg_trace_event('sched_switch')
-        df = df[['__pid']].drop_duplicates()
+        df = df[['__pid']].drop_duplicates(keep='first')
         for s in df.iterrows():
             self.pid_list.append(s[1]['__pid'])
 
         # Build the pid_tgid map (skip pids without tgid)
         df = self._dfg_trace_event('sched_switch')
-        df = df[['__pid', '__tgid']].drop_duplicates()
+        df = df[['__pid', '__tgid']].drop_duplicates(keep='first')
         df_with_tgids = df[df['__tgid'] != -1]
         for s in df_with_tgids.iterrows():
             self.pid_tgid[s[1]['__pid']] = s[1]['__tgid']
@@ -160,11 +161,9 @@ class ResidencyAnalysis(AnalysisModule):
         logging.info("TOTAL number of TGIDs: {}".format(self.npids_tgid))
 
         # Create empty hash tables, 1 per CPU for each each residency
+        self.residency[pivot] = []
         for cpunr in range(0, self.ncpus):
-            self.residency['pid'].append({})
-            self.residency['tgid'].append({})
-            self.residency['cpuset'].append({})
-            self.residency['schedtune'].append({})
+            self.residency[pivot].append({})
 
         # Calculate residencies
         if hasattr(self._trace.data_frame, event_name):
@@ -194,7 +193,51 @@ class ResidencyAnalysis(AnalysisModule):
         logging.info("total real time range of events: {}".format(self._trace.time_range))
         return df
 
+    def _dfg_cpu_residencies_cgroup(self, controller):
+        return self._dfg_cpu_residencies(controller, 'sched_switch_cgroup')
 
+    def plot_cgroup(self, controller, cgroup='all', idle=False):
+        """
+        controller: name of the controller
+        idle: Consider idle time?
+        """
+        df = self._dfg_cpu_residencies_cgroup(controller)
+	# Plot per-CPU break down for a single CGroup (Single pie plot)
+        if cgroup != 'all':
+            df = df[df.index == cgroup]
+            df = df.drop('total', 1)
+            df = df.apply(lambda x: x*10)
+
+            plt.style.use('ggplot')
+            colors = plt.rcParams['axes.color_cycle']
+            fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(8,8))
+            patches, texts, autotexts = axes.pie(df.loc[cgroup], labels=df.columns, autopct='%.2f', colors=colors)
+            axes.set(ylabel='', title=cgroup + ' per CPU percentage breakdown', aspect='equal')
+
+            axes.legend(bbox_to_anchor=(0, 0.5))
+            proptease = fm.FontProperties()
+            proptease.set_size('x-large')
+            plt.setp(autotexts, fontproperties=proptease)
+            plt.setp(texts, fontproperties=proptease)
+
+            plt.show()
+            return
+
+	# Otherwise, Plot per-CGroup of a Controller down for each CPU
+        if not idle:
+            df = df[pd.isnull(df.index) != True]
+        # Bug in matplot lib causes plotting issues when residency is < 1
+        df = df.apply(lambda x: x*10)
+        plt.style.use('ggplot')
+        colors = plt.rcParams['axes.color_cycle']
+        fig, axes = plt.subplots(nrows=5, ncols=2, figsize=(12,30))
+
+        for ax, col in zip(axes.flat, df.columns):
+            ax.pie(df[col], labels=df.index, autopct='%.2f', colors=colors)
+            ax.set(ylabel='', title=col, aspect='equal')
+
+        axes[0, 0].legend(bbox_to_anchor=(0, 0.5))
+        plt.show()
 
 
 
